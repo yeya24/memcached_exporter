@@ -16,13 +16,12 @@ package exporter
 import (
 	"crypto/tls"
 	"errors"
+	"log/slog"
 	"net"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
 	"github.com/grobie/gomemcache/memcache"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -39,7 +38,7 @@ var errKeyNotFound = errors.New("key not found")
 type Exporter struct {
 	address   string
 	timeout   time.Duration
-	logger    log.Logger
+	logger    *slog.Logger
 	tlsConfig *tls.Config
 
 	up                       *prometheus.Desc
@@ -63,6 +62,8 @@ type Exporter struct {
 	itemsTotal               *prometheus.Desc
 	evictions                *prometheus.Desc
 	reclaimed                *prometheus.Desc
+	itemStoreTooLarge        *prometheus.Desc
+	itemStoreNoMemory        *prometheus.Desc
 	lruCrawlerEnabled        *prometheus.Desc
 	lruCrawlerSleep          *prometheus.Desc
 	lruCrawlerMaxItems       *prometheus.Desc
@@ -77,6 +78,7 @@ type Exporter struct {
 	lruCrawlerMovesToCold    *prometheus.Desc
 	lruCrawlerMovesToWarm    *prometheus.Desc
 	lruCrawlerMovesWithinLru *prometheus.Desc
+	directReclaims           *prometheus.Desc
 	malloced                 *prometheus.Desc
 	itemsNumber              *prometheus.Desc
 	itemsAge                 *prometheus.Desc
@@ -131,7 +133,7 @@ type Exporter struct {
 }
 
 // New returns an initialized exporter.
-func New(server string, timeout time.Duration, logger log.Logger, tlsConfig *tls.Config) *Exporter {
+func New(server string, timeout time.Duration, logger *slog.Logger, tlsConfig *tls.Config) *Exporter {
 	return &Exporter{
 		address:   server,
 		timeout:   timeout,
@@ -260,6 +262,24 @@ func New(server string, timeout time.Duration, logger log.Logger, tlsConfig *tls
 		reclaimed: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, "", "items_reclaimed_total"),
 			"Total number of times an entry was stored using memory from an expired entry.",
+			nil,
+			nil,
+		),
+		itemStoreTooLarge: prometheus.NewDesc(
+			prometheus.BuildFQName(Namespace, "", "item_too_large_total"),
+			"The number of times an item exceeded the max-item-size when being stored.",
+			nil,
+			nil,
+		),
+		itemStoreNoMemory: prometheus.NewDesc(
+			prometheus.BuildFQName(Namespace, "", "item_no_memory_total"),
+			"The number of times an item could not be stored due to no more memory.",
+			nil,
+			nil,
+		),
+		directReclaims: prometheus.NewDesc(
+			prometheus.BuildFQName(Namespace, "", "direct_reclaims_total"),
+			"Times worker threads had to directly reclaim or evict items.",
 			nil,
 			nil,
 		),
@@ -680,6 +700,8 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- e.itemsTotal
 	ch <- e.evictions
 	ch <- e.reclaimed
+	ch <- e.itemStoreTooLarge
+	ch <- e.itemStoreNoMemory
 	ch <- e.lruCrawlerEnabled
 	ch <- e.lruCrawlerSleep
 	ch <- e.lruCrawlerMaxItems
@@ -689,6 +711,7 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- e.lruHotMaxAgeFactor
 	ch <- e.lruWarmMaxAgeFactor
 	ch <- e.lruCrawlerStarts
+	ch <- e.directReclaims
 	ch <- e.lruCrawlerReclaimed
 	ch <- e.lruCrawlerItemsChecked
 	ch <- e.lruCrawlerMovesToCold
@@ -754,7 +777,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	c, err := memcache.New(e.address)
 	if err != nil {
 		ch <- prometheus.MustNewConstMetric(e.up, prometheus.GaugeValue, 0)
-		level.Error(e.logger).Log("msg", "Failed to connect to memcached", "err", err)
+		e.logger.Error("Failed to connect to memcached", "err", err)
 		return
 	}
 	c.Timeout = e.timeout
@@ -763,12 +786,12 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	up := float64(1)
 	stats, err := c.Stats()
 	if err != nil {
-		level.Error(e.logger).Log("msg", "Failed to collect stats from memcached", "err", err)
+		e.logger.Error("Failed to collect stats from memcached", "err", err)
 		up = 0
 	}
 	statsSettings, err := c.StatsSettings()
 	if err != nil {
-		level.Error(e.logger).Log("msg", "Could not query stats settings", "err", err)
+		e.logger.Error("Could not query stats settings", "err", err)
 		up = 0
 	}
 
@@ -793,6 +816,8 @@ func (e *Exporter) parseStats(ch chan<- prometheus.Metric, stats map[net.Addr]me
 		"expired_unfetched": e.itemsExpiredUnfetched,
 		"outofmemory":       e.itemsOutofmemory,
 		"reclaimed":         e.itemsReclaimed,
+		"store_too_large":   e.itemStoreTooLarge,
+		"store_no_memory":   e.itemStoreNoMemory,
 		"tailrepairs":       e.itemsTailrepairs,
 		"mem_requested":     e.slabsMemRequested,
 		"moves_to_cold":     e.itemsMovesToCold,
@@ -839,11 +864,11 @@ func (e *Exporter) parseStats(ch chan<- prometheus.Metric, stats map[net.Addr]me
 			if cas, casErr := sum(s, "cas_misses", "cas_hits", "cas_badval"); casErr == nil {
 				ch <- prometheus.MustNewConstMetric(e.commands, prometheus.CounterValue, setCmd-cas, "set", "hit")
 			} else {
-				level.Error(e.logger).Log("msg", "Failed to parse cas", "err", casErr)
+				e.logger.Error("Failed to parse cas", "err", casErr)
 				parseError = casErr
 			}
 		} else {
-			level.Error(e.logger).Log("msg", "Failed to parse set", "err", err)
+			e.logger.Error("Failed to parse set", "err", err)
 			parseError = err
 		}
 
@@ -892,7 +917,10 @@ func (e *Exporter) parseStats(ch chan<- prometheus.Metric, stats map[net.Addr]me
 			e.parseAndNewMetric(ch, e.listenerDisabledTotal, prometheus.CounterValue, s, "listen_disabled_num"),
 			e.parseAndNewMetric(ch, e.evictions, prometheus.CounterValue, s, "evictions"),
 			e.parseAndNewMetric(ch, e.reclaimed, prometheus.CounterValue, s, "reclaimed"),
+			e.parseAndNewMetric(ch, e.itemStoreTooLarge, prometheus.CounterValue, s, "store_too_large"),
+			e.parseAndNewMetric(ch, e.itemStoreNoMemory, prometheus.CounterValue, s, "store_no_memory"),
 			e.parseAndNewMetric(ch, e.lruCrawlerStarts, prometheus.CounterValue, s, "lru_crawler_starts"),
+			e.parseAndNewMetric(ch, e.directReclaims, prometheus.CounterValue, s, "direct_reclaims"),
 			e.parseAndNewMetric(ch, e.lruCrawlerItemsChecked, prometheus.CounterValue, s, "crawler_items_checked"),
 			e.parseAndNewMetric(ch, e.lruCrawlerReclaimed, prometheus.CounterValue, s, "crawler_reclaimed"),
 			e.parseAndNewMetric(ch, e.lruCrawlerMovesToCold, prometheus.CounterValue, s, "moves_to_cold"),
@@ -953,11 +981,11 @@ func (e *Exporter) parseStats(ch chan<- prometheus.Metric, stats map[net.Addr]me
 				if slabCas, slabCasErr := sum(v, "cas_hits", "cas_badval"); slabCasErr == nil {
 					ch <- prometheus.MustNewConstMetric(e.slabsCommands, prometheus.CounterValue, slabSetCmd-slabCas, slab, "set", "hit")
 				} else {
-					level.Error(e.logger).Log("msg", "Failed to parse cas", "err", slabCasErr)
+					e.logger.Error("Failed to parse cas", "err", slabCasErr)
 					parseError = slabCasErr
 				}
 			} else {
-				level.Error(e.logger).Log("msg", "Failed to parse set", "err", err)
+				e.logger.Error("Failed to parse set", "err", err)
 				parseError = err
 			}
 
@@ -1018,7 +1046,7 @@ func (e *Exporter) parseTimevalAndNewMetric(ch chan<- prometheus.Metric, desc *p
 	return e.extractValueAndNewMetric(ch, desc, valueType, parseTimeval, stats, key, labelValues...)
 }
 
-func (e *Exporter) extractValueAndNewMetric(ch chan<- prometheus.Metric, desc *prometheus.Desc, valueType prometheus.ValueType, f func(map[string]string, string, log.Logger) (float64, error), stats map[string]string, key string, labelValues ...string) error {
+func (e *Exporter) extractValueAndNewMetric(ch chan<- prometheus.Metric, desc *prometheus.Desc, valueType prometheus.ValueType, f func(map[string]string, string, *slog.Logger) (float64, error), stats map[string]string, key string, labelValues ...string) error {
 	v, err := f(stats, key, e.logger)
 	if err == errKeyNotFound {
 		return nil
@@ -1031,25 +1059,25 @@ func (e *Exporter) extractValueAndNewMetric(ch chan<- prometheus.Metric, desc *p
 	return nil
 }
 
-func parse(stats map[string]string, key string, logger log.Logger) (float64, error) {
+func parse(stats map[string]string, key string, logger *slog.Logger) (float64, error) {
 	value, ok := stats[key]
 	if !ok {
-		level.Debug(logger).Log("msg", "Key not found", "key", key)
+		logger.Debug("Key not found", "key", key)
 		return 0, errKeyNotFound
 	}
 
 	v, err := strconv.ParseFloat(value, 64)
 	if err != nil {
-		level.Error(logger).Log("msg", "Failed to parse", "key", key, "value", value, "err", err)
+		logger.Error("Failed to parse", "key", key, "value", value, "err", err)
 		return 0, err
 	}
 	return v, nil
 }
 
-func parseBool(stats map[string]string, key string, logger log.Logger) (float64, error) {
+func parseBool(stats map[string]string, key string, logger *slog.Logger) (float64, error) {
 	value, ok := stats[key]
 	if !ok {
-		level.Debug(logger).Log("msg", "Key not found", "key", key)
+		logger.Debug("Key not found", "key", key)
 		return 0, errKeyNotFound
 	}
 
@@ -1059,33 +1087,33 @@ func parseBool(stats map[string]string, key string, logger log.Logger) (float64,
 	case "no":
 		return 0, nil
 	default:
-		level.Error(logger).Log("msg", "Failed to parse", "key", key, "value", value)
+		logger.Error("Failed to parse", "key", key, "value", value)
 		return 0, errors.New("failed parse a bool value")
 	}
 }
 
-func parseTimeval(stats map[string]string, key string, logger log.Logger) (float64, error) {
+func parseTimeval(stats map[string]string, key string, logger *slog.Logger) (float64, error) {
 	value, ok := stats[key]
 	if !ok {
-		level.Debug(logger).Log("msg", "Key not found", "key", key)
+		logger.Debug("Key not found", "key", key)
 		return 0, errKeyNotFound
 	}
 	values := strings.Split(value, ".")
 
 	if len(values) != 2 {
-		level.Error(logger).Log("msg", "Failed to parse", "key", key, "value", value)
+		logger.Error("Failed to parse", "key", key, "value", value)
 		return 0, errors.New("failed parse a timeval value")
 	}
 
 	seconds, err := strconv.ParseFloat(values[0], 64)
 	if err != nil {
-		level.Error(logger).Log("msg", "Failed to parse", "key", key, "value", value, "err", err)
+		logger.Error("Failed to parse", "key", key, "value", value, "err", err)
 		return 0, errors.New("failed parse a timeval value")
 	}
 
 	microseconds, err := strconv.ParseFloat(values[1], 64)
 	if err != nil {
-		level.Error(logger).Log("msg", "Failed to parse", "key", key, "value", value, "err", err)
+		logger.Error("Failed to parse", "key", key, "value", value, "err", err)
 		return 0, errors.New("failed parse a timeval value")
 	}
 
