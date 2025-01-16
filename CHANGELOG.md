@@ -1,3 +1,41 @@
+## 0.15.0 / 2024-11-08
+
+* [CHANGE] Update dependencies
+* [ENHANCEMENT] Add metric for `direct_reclaims` #227
+
+## 0.14.4 / 2024-06-24
+
+* [CHANGE] Update dependencies
+
+This addresses CVE-2023-45288
+
+## 0.14.3 / 2024-03-22
+
+* [CHANGE] Update dependencies
+
+This addresses CVE-2024-24786 which is not exploitable in the exporter, but set off security scanners.
+
+## 0.14.2 / 2023-12-22
+
+* [CHANGE] Update dependencies
+
+This addresses CVE-2023-48795 which is not exploitable in the exporter, but set off security scanners.
+
+## 0.14.1 / 2023-12-06
+
+* [CHANGE] Build with Go 1.21 #190
+* [BUGFIX] Add missing `_total` suffix for metrics for failure to store items #191
+
+## 0.14.0 / 2023-12-06
+
+* [FEATURE] Add metrics for failure to store items #184
+
+## 0.13.1 / 2023-12-06
+
+* [CHANGE] Update dependencies
+
+This addresses CVE-2023-3978 which is not exploitable in the exporter, but set off security scanners.
+
 ## 0.13.0 / 2023-06-02
 
 * [FEATURE] Multi-target scrape support #143, #173
